@@ -83,6 +83,30 @@ class SceneBuilder:
         self._cameras = list(cameras)
         return self
 
+    def _claim_id(self, id: str, kind: str) -> None:
+        """Reserve ``id`` for a new entity, or raise if something already holds it.
+
+        Entities and distractors share one id namespace, because ``build`` merges them
+        into a single spec list and keys the per-frame lookup by id. A duplicate used to
+        pass silently and split the scene in two: both entries reached ``scene.entities``
+        and the manifest, while ``frames_by_id`` kept only the last one written. Every
+        id-keyed consumer downstream — attachments, annotations, groups — then read the
+        survivor, so they saw one entity where a consumer parsing the manifest saw two.
+
+        Checked here rather than in ``build`` so the error can name the call that caused
+        it, which is the thing the caller can act on.
+        """
+        for existing, existing_kind in (
+            *((spec, "entity") for spec in self._entities),
+            *((spec, "distractor") for spec in self._distractors),
+        ):
+            if existing.id == id:
+                raise ValueError(
+                    f"duplicate entity id {id!r}: already added as a {existing_kind}, "
+                    f"cannot add it again as a {kind}. Entities and distractors share one "
+                    f"id namespace because the scene keys its per-frame lookup by id."
+                )
+
     def entity(
         self,
         id: str,
@@ -99,6 +123,7 @@ class SceneBuilder:
         behaviour (e.g. a jittered :class:`WaypointBehavior`) is deterministic and
         can be swept over >= 3 seeds; a plain path ignores it.
         """
+        self._claim_id(id, "entity")
         self._entities.append(
             _EntitySpec(id=id, behavior=_as_behavior(path), name=name, edges=edges, seed=seed)
         )
@@ -114,6 +139,7 @@ class SceneBuilder:
     ) -> SceneBuilder:
         """Add a non-target entity that appears in the manifest but never affects
         the visibility or ground truth of the primary entities."""
+        self._claim_id(id, "distractor")
         self._distractors.append(
             _EntitySpec(id=id, behavior=_as_behavior(path), name=name, edges=None, seed=seed)
         )
