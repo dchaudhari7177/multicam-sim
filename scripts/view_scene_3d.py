@@ -12,9 +12,15 @@ the world->camera translation, so the camera centre is ``C = -R^T @ t`` and the
 frustum edges are the back-projected image corners ``R^T @ (K^-1 @ [u, v, 1])``.
 World up is +z; the ground plane is drawn at z = 0.
 
+Coverage is legible at a glance: for the frame selected with ``--frame`` each
+camera is drawn green when it sees the object on that frame and grey when it is
+blind, with a light ray from every seeing camera to the point it sees, so
+overlap (two or more cameras on one object) shows up directly. The ``in_view``
+flags are read straight off the manifest -- the viewer never reprojects.
+
 Works on any manifest with the standard schema (``cameras[*].{K,R,t,width,
-height}`` and ``entities[*].frames[*].points[*].xyz_gt``); defaults to the
-bundled MTMC golden fixture.
+height}`` and ``entities[*].frames[*].points[*].{xyz_gt,per_cam[*].in_view}``);
+defaults to the bundled MTMC golden fixture.
 
 ``matplotlib`` is imported lazily inside :func:`main` (it is not a package
 dependency), mirroring the lazy-import pattern in ``scripts/record_multiview.py``.
@@ -22,6 +28,7 @@ Run::
 
     uv run --with matplotlib python scripts/view_scene_3d.py
     uv run --with matplotlib python scripts/view_scene_3d.py --manifest PATH --out PATH
+    uv run --with matplotlib python scripts/view_scene_3d.py --frame 40
 """
 
 from __future__ import annotations
@@ -42,6 +49,10 @@ _DEFAULT_OUT = _ROOT / "docs" / "assets" / "scene_3d.png"
 
 # How far in front of each camera to draw the frustum apex (world units).
 _FRUSTUM_DEPTH = 1.2
+
+# Frustum colours for the selected frame: sees the object vs. blind to it.
+_SEEING_COLOUR = "seagreen"
+_BLIND_COLOUR = "slategrey"
 
 
 def _camera_centre(
@@ -101,8 +112,47 @@ def _trajectories(manifest: dict[str, Any]) -> list[tuple[str, NDArray[np.float6
     return out
 
 
-def render(manifest: dict[str, Any], out_path: Path) -> Path:
-    """Render the 3D scene view to ``out_path`` (PNG) and return the path."""
+def _frame_numbers(manifest: dict[str, Any]) -> list[int]:
+    """Every frame number present on any entity, ascending."""
+    numbers = {
+        int(frame["frame"])
+        for entity in manifest.get("entities", [])
+        for frame in entity.get("frames", [])
+        if "frame" in frame
+    }
+    return sorted(numbers)
+
+
+def _coverage_at_frame(
+    manifest: dict[str, Any], frame_number: int
+) -> dict[int, list[NDArray[np.float64]]]:
+    """Map each camera id to the ground-truth points it sees on ``frame_number``.
+
+    Read straight from the manifest's per-camera ``in_view`` flags -- the sim's
+    own projection/visibility answer -- so the viewer never reprojects. Cameras
+    that see nothing are absent from the mapping.
+    """
+    seen: dict[int, list[NDArray[np.float64]]] = {}
+    for entity in manifest.get("entities", []):
+        for frame in entity.get("frames", []):
+            if int(frame.get("frame", -1)) != frame_number:
+                continue
+            for point in frame.get("points", {}).values():
+                xyz = point.get("xyz_gt")
+                if xyz is None:
+                    continue
+                target = np.asarray(xyz, dtype=np.float64)
+                for observation in point.get("per_cam", []):
+                    if observation.get("in_view"):
+                        seen.setdefault(int(observation["cam"]), []).append(target)
+    return seen
+
+
+def render(manifest: dict[str, Any], out_path: Path, frame_number: int = 0) -> Path:
+    """Render the 3D scene view to ``out_path`` (PNG) and return the path.
+
+    Cameras are coloured by whether they see the object on ``frame_number``.
+    """
     import matplotlib
 
     matplotlib.use("Agg")  # headless-safe: no display needed
@@ -112,8 +162,10 @@ def render(manifest: dict[str, Any], out_path: Path) -> Path:
     ax = fig.add_subplot(111, projection="3d")
 
     all_points: list[NDArray[np.float64]] = []
+    seen_by_camera = _coverage_at_frame(manifest, frame_number)
 
-    # Cameras: centre marker + a wireframe frustum to the four image corners.
+    # Cameras: centre marker + a wireframe frustum to the four image corners,
+    # coloured green when the camera sees the object on this frame.
     for cam in manifest.get("cameras", []):
         intrinsics = np.asarray(cam["K"], dtype=np.float64)
         rotation = np.asarray(cam["R"], dtype=np.float64)
@@ -127,13 +179,27 @@ def render(manifest: dict[str, Any], out_path: Path) -> Path:
             float(cam["height"]),
             _FRUSTUM_DEPTH,
         )
-        ax.scatter(*centre, color="crimson", s=40, depthshade=False)
-        ax.text(*centre, f"  cam {cam['id']}", color="crimson", fontsize=8)
+        targets = seen_by_camera.get(int(cam["id"]), [])
+        colour = _SEEING_COLOUR if targets else _BLIND_COLOUR
+        ax.scatter(*centre, color=colour, s=40, depthshade=False)
+        ax.text(*centre, f"  cam {cam['id']}", color=colour, fontsize=8)
         for corner in corners:
             edge = np.vstack([centre, corner])
-            ax.plot(edge[:, 0], edge[:, 1], edge[:, 2], color="crimson", linewidth=0.8)
+            ax.plot(edge[:, 0], edge[:, 1], edge[:, 2], color=colour, linewidth=0.8)
         loop = np.vstack([corners, corners[0]])
-        ax.plot(loop[:, 0], loop[:, 1], loop[:, 2], color="crimson", linewidth=0.8)
+        ax.plot(loop[:, 0], loop[:, 1], loop[:, 2], color=colour, linewidth=0.8)
+        # A light ray to each point this camera sees, so overlap is obvious.
+        for target in targets:
+            ray = np.vstack([centre, target])
+            ax.plot(
+                ray[:, 0],
+                ray[:, 1],
+                ray[:, 2],
+                color=_SEEING_COLOUR,
+                linewidth=0.7,
+                linestyle=":",
+                alpha=0.55,
+            )
         all_points.append(centre[None, :])
         all_points.append(corners)
 
@@ -164,10 +230,19 @@ def render(manifest: dict[str, Any], out_path: Path) -> Path:
     )
     ax.plot_surface(gx, gy, np.zeros_like(gx), alpha=0.12, color="steelblue")
 
+    # Legend proxies for the coverage colours (the frustums are plain lines).
+    seeing_count = len(seen_by_camera)
+    total_cameras = len(manifest.get("cameras", []))
+    ax.plot([], [], color=_SEEING_COLOUR, linewidth=0.8, label="camera: sees object")
+    ax.plot([], [], color=_BLIND_COLOUR, linewidth=0.8, label="camera: blind")
+
     ax.set_xlabel("x")
     ax.set_ylabel("y")
     ax.set_zlabel("z (up)")
-    ax.set_title("Scene: camera locations and object trajectory")
+    ax.set_title(
+        f"Scene: camera locations and object trajectory\n"
+        f"frame {frame_number}: {seeing_count}/{total_cameras} cameras see the object"
+    )
     ax.legend(loc="upper left", fontsize=8)
 
     # Equal aspect over the combined bounds so directions are not skewed.
@@ -195,10 +270,29 @@ def main() -> None:
         default=_DEFAULT_OUT,
         help="output PNG path (default: docs/assets/scene_3d.png)",
     )
+    parser.add_argument(
+        "--frame",
+        type=int,
+        default=None,
+        help="frame to colour camera coverage for (default: the manifest's first frame)",
+    )
     args = parser.parse_args()
 
     manifest = _load_manifest(args.manifest)
-    out_path = render(manifest, args.out)
+    available = _frame_numbers(manifest)
+    if args.frame is None:
+        frame_number = available[0] if available else 0
+    elif args.frame in available:
+        frame_number = args.frame
+    elif available:
+        parser.error(
+            f"--frame {args.frame} is not in the manifest; "
+            f"available frames: {available[0]}..{available[-1]}"
+        )
+    else:
+        parser.error(f"--frame {args.frame} is not in the manifest; it has no frames")
+
+    out_path = render(manifest, args.out, frame_number)
     size = out_path.stat().st_size
     print(f"wrote {out_path}  ({size} bytes)")
 
