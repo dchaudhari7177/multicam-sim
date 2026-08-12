@@ -55,8 +55,15 @@ external tracker.
 ![Coverage panel for the assembly-station scene: complementary overview and worktop camera coverage across the operator and parts.](docs/assets/assembly_station_coverage_metrics.png)
 
 **Can you recover a 3D point, or a human joint, when it is hidden in some camera
-views but still seen in others?** multicam-sim builds the synthetic multi-camera
-scenes you need to ask that question with ground truth in hand.
+views but still seen in others — and can you tell what a person actually did to
+which object?** multicam-sim builds the synthetic multi-camera scenes you need to
+ask those questions with ground truth in hand.
+
+Two shapes of scenario, one manifest: **non-overlapping coverage** (cameras with
+disjoint fields of view, where an object hands off between stations and falls into
+blind gaps) and **multi-station work-order / assembly-line** scenes (cameras aimed
+at different regions of a station, where an operator's actions and the items they
+move are only recoverable by fusing views). Both are domain-neutral and synthetic.
 
 It sets up N calibrated pinhole cameras around a scene, moves objects (or a
 skeleton) through it, decides for each camera which points are actually visible
@@ -64,6 +71,32 @@ versus occluded, and writes a single JSON **manifest**: the camera calibration,
 the ground-truth 3D positions, every camera's 2D projection, and a per-point,
 per-view visibility label. No renderer and no GL, just analytic projection and
 boolean occlusion, so the geometry is exact.
+
+## Assembly-line / work-order scenes
+
+A second scenario shape: instead of one object crossing disjoint stations, an
+**operator** assembles an **order** at a station while two cameras are aimed at
+different regions — one framing the person, one framing the worktop. Their
+per-entity `in_view` flags come out complementary, so recovering the whole job
+means fusing views. The example also emits verified work-order ground truth
+(`order.json`: `status` / `expected` / `placed` / `missing` / `extra` / `wrong`,
+plus which joint placed what and when).
+
+```bash
+python examples/assembly_station.py                     # manifest.json + order.json
+python examples/assembly_station.py --placement-synced  # + interactions.json
+```
+
+![3D view of the assembly-station scene: the overview camera's frustum to the north covering the operator, the worktop camera's frustum to the east covering the container, and the item trajectories moving into the container.](docs/assets/assembly_station_scene_3d.png)
+
+*Seeing the space: both camera frustums, the ground plane, and every entity's
+ground-truth trajectory in one figure — the two cones cover clearly separate
+volumes, which is the coverage split made visible. Reproduce: `uv run --with
+matplotlib python scripts/view_scene_3d.py --manifest examples/out/manifest.json
+--out docs/assets/assembly_station_scene_3d.png`.*
+
+Full walkthrough — scene geometry, the work-order sidecar, the placement-synced
+preset and its deliberate negatives: **[docs/assembly-line.md](docs/assembly-line.md)**.
 
 ## What it produces
 
