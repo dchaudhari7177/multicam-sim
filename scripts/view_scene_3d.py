@@ -16,12 +16,22 @@ Works on any manifest with the standard schema (``cameras[*].{K,R,t,width,
 height}`` and ``entities[*].frames[*].points[*].xyz_gt``); defaults to the
 bundled MTMC golden fixture.
 
-``matplotlib`` is imported lazily inside :func:`main` (it is not a package
-dependency), mirroring the lazy-import pattern in ``scripts/record_multiview.py``.
-Run::
+``--animate`` exports an animated GIF instead: ``--animate-mode orbit`` (the
+default) sweeps the viewpoint right round the scene so coverage and frustum
+overlap can be read from any angle, and ``--animate-mode trajectory`` holds the
+viewpoint still and walks the object along its path. The static-PNG default is
+untouched.
+
+``matplotlib`` (and ``PIL`` for the GIF) is imported lazily inside the render
+functions (neither is a package dependency), mirroring the lazy-import pattern in
+``scripts/record_multiview.py``. GIFs are written with Pillow, as there too, so no
+ffmpeg/imageio encoder is required. Run::
 
     uv run --with matplotlib python scripts/view_scene_3d.py
     uv run --with matplotlib python scripts/view_scene_3d.py --manifest PATH --out PATH
+    uv run --with matplotlib python scripts/view_scene_3d.py --animate --out scene.gif
+    uv run --with matplotlib python scripts/view_scene_3d.py --animate \
+        --animate-mode trajectory --out walk.gif
 """
 
 from __future__ import annotations
@@ -42,6 +52,20 @@ _DEFAULT_OUT = _ROOT / "docs" / "assets" / "scene_3d.png"
 
 # How far in front of each camera to draw the frustum apex (world units).
 _FRUSTUM_DEPTH = 1.2
+
+#: Animation modes for ``--animate``.
+ORBIT = "orbit"
+TRAJECTORY = "trajectory"
+
+#: Animation defaults. 36 frames is a 10-degree azimuth step — smooth enough to
+#: read, small enough that the GIF stays reviewable in a PR. The figure is drawn
+#: smaller and at a lower DPI than the static PNG so a 36-frame GIF does not
+#: dwarf the repo's other assets.
+ANIMATE_FRAMES = 36
+ANIMATE_MS = 120
+ANIMATE_DPI = 80
+ANIMATE_FIGSIZE = (7.0, 5.5)
+_DEFAULT_ANIMATE_OUT = _ROOT / "docs" / "assets" / "scene_3d.gif"
 
 
 def _camera_centre(
@@ -101,16 +125,19 @@ def _trajectories(manifest: dict[str, Any]) -> list[tuple[str, NDArray[np.float6
     return out
 
 
-def render(manifest: dict[str, Any], out_path: Path) -> Path:
-    """Render the 3D scene view to ``out_path`` (PNG) and return the path."""
-    import matplotlib
+def _draw_scene(
+    ax: Any, manifest: dict[str, Any], *, upto: int | None = None
+) -> NDArray[np.float64]:
+    """Draw cameras, trajectories and the ground plane onto ``ax``.
 
-    matplotlib.use("Agg")  # headless-safe: no display needed
-    import matplotlib.pyplot as plt
+    Returns every scene point, for the caller's bounds/aspect computation.
 
-    fig = plt.figure(figsize=(9, 7))
-    ax = fig.add_subplot(111, projection="3d")
-
+    ``upto`` truncates each trajectory to its first ``upto`` samples — the
+    animated trajectory mode, where the polyline grows frame by frame and the
+    leading sample is marked. The returned points always span the *full* path
+    regardless, so the view does not drift between frames. ``None`` (the default,
+    and the static path) draws every sample with no marker.
+    """
     all_points: list[NDArray[np.float64]] = []
 
     # Cameras: centre marker + a wireframe frustum to the four image corners.
@@ -139,16 +166,29 @@ def render(manifest: dict[str, Any], out_path: Path) -> Path:
 
     # Trajectories: one polyline per entity point.
     for label, coords in _trajectories(manifest):
-        ax.plot(
-            coords[:, 0],
-            coords[:, 1],
-            coords[:, 2],
+        all_points.append(coords)  # bounds always span the whole path
+        shown = coords if upto is None else coords[: max(upto, 1)]
+        line = ax.plot(
+            shown[:, 0],
+            shown[:, 1],
+            shown[:, 2],
             marker="o",
             markersize=3,
             linewidth=1.5,
             label=f"trajectory: {label}",
         )
-        all_points.append(coords)
+        if upto is not None:
+            # Mark where the object currently is, so motion is legible even
+            # when the trailing polyline is short.
+            head = shown[-1]
+            ax.scatter(
+                *head,
+                s=70,
+                color=line[0].get_color(),
+                edgecolor="black",
+                linewidth=0.6,
+                depthshade=False,
+            )
 
     if not all_points:
         raise ValueError("manifest has no cameras or trajectories to draw")
@@ -168,16 +208,120 @@ def render(manifest: dict[str, Any], out_path: Path) -> Path:
     ax.set_ylabel("y")
     ax.set_zlabel("z (up)")
     ax.set_title("Scene: camera locations and object trajectory")
-    ax.legend(loc="upper left", fontsize=8)
+    # Only when something is labelled: a camera-only manifest has no trajectory
+    # to list, and matplotlib warns ("No artists with labels found") rather than
+    # quietly drawing an empty box.
+    if ax.get_legend_handles_labels()[1]:
+        ax.legend(loc="upper left", fontsize=8)
 
     # Equal aspect over the combined bounds so directions are not skewed.
     span = pts.max(axis=0) - pts.min(axis=0)
     span = np.where(span > 0, span, 1.0)
     ax.set_box_aspect(tuple(span))
+    return pts
+
+
+def render(manifest: dict[str, Any], out_path: Path) -> Path:
+    """Render the 3D scene view to ``out_path`` (PNG) and return the path."""
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless-safe: no display needed
+    import matplotlib.pyplot as plt
+
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection="3d")
+    _draw_scene(ax, manifest)
 
     out_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out_path, dpi=130, bbox_inches="tight")
     plt.close(fig)
+    return out_path
+
+
+def _trajectory_length(manifest: dict[str, Any]) -> int:
+    """Longest trajectory sample count, for pacing the trajectory animation."""
+    return max((len(coords) for _, coords in _trajectories(manifest)), default=0)
+
+
+def render_animation(
+    manifest: dict[str, Any],
+    out_path: Path,
+    *,
+    mode: str = ORBIT,
+    frames: int = ANIMATE_FRAMES,
+    frame_ms: int = ANIMATE_MS,
+) -> Path:
+    """Render an animated GIF of the scene to ``out_path`` and return the path.
+
+    ``mode`` is :data:`ORBIT` (azimuth sweep right round the scene, geometry
+    fixed) or :data:`TRAJECTORY` (fixed viewpoint, object walking its path).
+
+    GIF is written with Pillow, mirroring the animation path in
+    ``scripts/record_multiview.py`` — no ``imageio``/ffmpeg encoder needed, so it
+    works on a bare headless box.
+    """
+    import io
+
+    import matplotlib
+
+    matplotlib.use("Agg")  # headless-safe: no display needed
+    import matplotlib.pyplot as plt
+    from PIL import Image
+
+    if mode not in (ORBIT, TRAJECTORY):
+        raise ValueError(f"unknown animation mode {mode!r}; expected {ORBIT} or {TRAJECTORY}")
+    if frames < 1:
+        raise ValueError(f"frames must be >= 1 (got {frames})")
+
+    samples = _trajectory_length(manifest)
+    if mode == TRAJECTORY and samples == 0:
+        raise ValueError("manifest has no trajectory to animate; use --animate-mode orbit")
+
+    def snapshot(fig: Any) -> Image.Image:
+        buf = io.BytesIO()
+        # Deliberately NOT bbox_inches="tight" here, unlike the static PNG: a
+        # tight box is recomputed per frame, and as the view rotates the artists'
+        # extent changes, so frames come out at different pixel sizes (354..436
+        # px wide for the bundled fixture). A GIF pastes every frame onto the
+        # first frame's canvas, so that shows up as jitter and clipped edges.
+        # The full canvas is a fixed figsize x dpi for every frame.
+        fig.savefig(buf, format="png", dpi=ANIMATE_DPI)
+        buf.seek(0)
+        return Image.open(buf).convert("RGB")
+
+    images: list[Image.Image] = []
+    if mode == ORBIT:
+        # The geometry never changes, so draw once and only move the camera.
+        fig = plt.figure(figsize=ANIMATE_FIGSIZE)
+        ax = fig.add_subplot(111, projection="3d")
+        _draw_scene(ax, manifest)
+        elev = ax.elev
+        for index in range(frames):
+            ax.view_init(elev=elev, azim=index * 360.0 / frames)
+            images.append(snapshot(fig))
+        plt.close(fig)
+    else:
+        # More frames than trajectory samples would re-render figures that are
+        # pixel-identical (Pillow collapses them on write anyway), so cap it and
+        # step one sample per frame at the limit.
+        frames = min(frames, samples)
+        for index in range(frames):
+            upto = max(1, round((index + 1) * samples / frames))
+            fig = plt.figure(figsize=ANIMATE_FIGSIZE)
+            ax = fig.add_subplot(111, projection="3d")
+            _draw_scene(ax, manifest, upto=upto)
+            images.append(snapshot(fig))
+            plt.close(fig)
+
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    images[0].save(
+        out_path,
+        save_all=True,
+        append_images=images[1:],
+        duration=frame_ms,
+        loop=0,
+        optimize=True,
+    )
     return out_path
 
 
@@ -192,13 +336,52 @@ def main() -> None:
     parser.add_argument(
         "--out",
         type=Path,
-        default=_DEFAULT_OUT,
-        help="output PNG path (default: docs/assets/scene_3d.png)",
+        default=None,
+        help=(
+            "output path (default: docs/assets/scene_3d.png, "
+            "or docs/assets/scene_3d.gif with --animate)"
+        ),
+    )
+    parser.add_argument(
+        "--animate",
+        action="store_true",
+        help="export an animated GIF instead of a static PNG",
+    )
+    parser.add_argument(
+        "--animate-mode",
+        choices=(ORBIT, TRAJECTORY),
+        default=ORBIT,
+        help=(
+            f"{ORBIT}: sweep the viewpoint right round the scene; "
+            f"{TRAJECTORY}: fixed viewpoint, object walks its path "
+            f"(default: {ORBIT})"
+        ),
+    )
+    parser.add_argument(
+        "--frames",
+        type=int,
+        default=ANIMATE_FRAMES,
+        help=f"animation frame count (default: {ANIMATE_FRAMES})",
+    )
+    parser.add_argument(
+        "--frame-ms",
+        type=int,
+        default=ANIMATE_MS,
+        help=f"per-frame duration in milliseconds (default: {ANIMATE_MS})",
     )
     args = parser.parse_args()
 
     manifest = _load_manifest(args.manifest)
-    out_path = render(manifest, args.out)
+    if args.animate:
+        out_path = render_animation(
+            manifest,
+            args.out or _DEFAULT_ANIMATE_OUT,
+            mode=args.animate_mode,
+            frames=args.frames,
+            frame_ms=args.frame_ms,
+        )
+    else:
+        out_path = render(manifest, args.out or _DEFAULT_OUT)
     size = out_path.stat().st_size
     print(f"wrote {out_path}  ({size} bytes)")
 
